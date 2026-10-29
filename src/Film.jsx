@@ -1,60 +1,86 @@
 import { useEffect, useRef, useState } from 'react';
 import { useMotionValueEvent, useScroll } from 'framer-motion';
 import { CONFIG } from './config';
-import { createLoader, loadManifest, nearest } from './frames';
+import { FrameStore, loadManifest } from './frames';
 import { useStore } from './store';
+import Overlay from './Overlay';
+
+const dims = (b) => [b.naturalWidth || b.width, b.naturalHeight || b.height];
+
+const avgColor = (img) => {
+  try {
+    const t = document.createElement('canvas');
+    t.width = t.height = 1;
+    const x = t.getContext('2d');
+    x.drawImage(img, 0, 0, 1, 1);
+    const d = x.getImageData(0, 0, 1, 1).data;
+    return 'rgb(' + d[0] + ',' + d[1] + ',' + d[2] + ')';
+  } catch (e) { return null; }
+};
+
+function paint(ctx, c, img, alpha) {
+  const [iw, ih] = dims(img);
+  const pick = CONFIG.fit === 'contain' ? Math.min : Math.max;
+  const s = pick(c.width / iw, c.height / ih);
+  const w = iw * s, h = ih * s;
+  ctx.globalAlpha = alpha;
+  ctx.drawImage(img, (c.width - w) * CONFIG.focusX, (c.height - h) * CONFIG.focusY, w, h);
+}
 
 export default function Film() {
   const section = useRef(null);
   const canvas = useRef(null);
-  const loader = useRef(null);
+  const store = useRef(null);
   const count = useRef(0);
   const target = useRef(0);
   const current = useRef(0);
-  const shown = useRef(-1);
+  const shown = useRef('');
+  const way = useRef(1);
   const raf = useRef(0);
   const lastT = useRef(0);
   const [failed, setFailed] = useState(false);
   const reduced = useStore((s) => s.reduced);
   const { scrollYProgress } = useScroll({ target: section, offset: ['start start', 'end end'] });
 
-  const draw = (force = false) => {
-    const c = canvas.current;
-    const L = loader.current;
-    if (!c || !L || !c.width) return;
-    const idx = nearest(L.frames, Math.round(current.current));
-    if (idx < 0) return;
-    if (!force && idx === shown.current) return;
+  const draw = (force) => {
+    const c = canvas.current, S = store.current;
+    if (!c || !S || !c.width) return;
+    const pos = current.current;
+    const i = CONFIG.blend ? Math.floor(pos) : Math.round(pos);
+    const f = CONFIG.blend ? pos - i : 0;
+    const a = S.pick(i);
+    if (a < 0) return;
+    const key = a + ':' + (f > 0.04 ? Math.round(f * 8) : 0);
+    if (!force && key === shown.current) return;
     const ctx = c.getContext('2d');
-    if (!ctx) return;
-    const img = L.frames[idx];
-    const cw = c.width, ch = c.height;
-    const pick = CONFIG.fit === 'cover' ? Math.max : Math.min;
-    const s = pick(cw / img.naturalWidth, ch / img.naturalHeight);
-    const w = img.naturalWidth * s, h = img.naturalHeight * s;
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = CONFIG.smoothQuality;
     ctx.globalAlpha = 1;
     ctx.fillStyle = CONFIG.bg;
-    ctx.fillRect(0, 0, cw, ch);
-    ctx.drawImage(img, (cw - w) / 2, (ch - h) / 2, w, h);
-    shown.current = idx;
+    ctx.fillRect(0, 0, c.width, c.height);
+    paint(ctx, c, S.maps[a], 1);
+    if (f > 0.04 && a === i && S.maps[i + 1]) paint(ctx, c, S.maps[i + 1], f);
+    ctx.globalAlpha = 1;
+    shown.current = key;
   };
 
   const tick = (t) => {
     const dt = lastT.current ? Math.min(0.1, (t - lastT.current) / 1000) : 0.016;
     lastT.current = t;
     const diff = target.current - current.current;
-    if (Math.abs(diff) < 0.02) {
+    if (Math.abs(diff) < 0.01) {
       current.current = target.current;
-      draw();
+      draw(false);
       raf.current = 0;
       lastT.current = 0;
       return;
     }
+    way.current = diff > 0 ? 1 : -1;
     current.current += diff * (1 - Math.exp(-dt * CONFIG.smoothing));
-    draw();
+    if (store.current) store.current.ensure(Math.round(current.current), way.current);
+    draw(false);
     raf.current = requestAnimationFrame(tick);
   };
-
   const kick = () => {
     if (!raf.current && !document.hidden) { lastT.current = 0; raf.current = requestAnimationFrame(tick); }
   };
@@ -67,34 +93,51 @@ export default function Film() {
 
   useEffect(() => {
     let dead = false;
-    loadManifest().then((m) => {
+    const portrait = window.matchMedia('(orientation: portrait)').matches;
+    loadManifest(portrait ? 'frames-m' : 'frames').then((m) => {
       if (dead) return;
       count.current = m.count;
       const start = reduced ? 0 : Math.round(Math.max(0, Math.min(1, scrollYProgress.get())) * (m.count - 1));
       current.current = start; target.current = start;
-      const L = createLoader(m.count, {
-        onFrame: (i, loaded, ok) => {
-          if (dead) return;
-          if (i === 0 && !ok) { setFailed(true); return; }
-          if (ok && Math.abs(i - current.current) < 1.5) { shown.current = -1; draw(true); }
-        },
+      const S = new FrameStore(m.dir, m.count, { maxInflight: CONFIG.maxInflight });
+      store.current = S;
+      S.onDecoded = (i) => {
+        if (dead) return;
+        if (!S.sized) {
+          S.sized = true;
+          const [w, h] = dims(S.maps[i]);
+          S.setWindow(w, h, CONFIG.windowMB);
+          const col = avgColor(S.maps[i]);
+          if (col && section.current) section.current.style.background = col;
+          if (reduced) S.halted = true;
+        }
+        draw(false);
+      };
+      S.start(start, CONFIG.concurrency, (ok) => {
+        if (dead) return;
+        if (!ok) setFailed(true); else S.ensure(start, 1, true);
       });
-      loader.current = L;
-      L.start(CONFIG.concurrency).then(() => { if (!dead) { shown.current = -1; draw(true); } });
     }).catch((e) => { console.error('[film]', e.message); if (!dead) setFailed(true); });
-    return () => { dead = true; if (loader.current) loader.current.abort(); cancelAnimationFrame(raf.current); raf.current = 0; };
+    return () => {
+      dead = true;
+      if (store.current) { store.current.destroy(); store.current = null; }
+      cancelAnimationFrame(raf.current); raf.current = 0;
+    };
     // eslint-disable-next-line
   }, [reduced]);
 
   useEffect(() => {
-    const el = canvas.current?.parentElement;
-    if (!el || !canvas.current) return;
+    const c = canvas.current;
+    if (!c) return;
+    const el = c.parentElement;
     const fit = () => {
-      const dpr = Math.min(window.devicePixelRatio || 1, CONFIG.maxDpr);
       const r = el.getBoundingClientRect();
-      canvas.current.width = Math.max(1, Math.round(r.width * dpr));
-      canvas.current.height = Math.max(1, Math.round(r.height * dpr));
-      shown.current = -1;
+      let dpr = Math.min(window.devicePixelRatio || 1, CONFIG.maxDpr);
+      const px = r.width * r.height * dpr * dpr;
+      if (px > CONFIG.maxPixels) dpr *= Math.sqrt(CONFIG.maxPixels / px);
+      c.width = Math.max(1, Math.round(r.width * dpr));
+      c.height = Math.max(1, Math.round(r.height * dpr));
+      shown.current = '';
       draw(true);
     };
     const ro = new ResizeObserver(fit);
@@ -106,7 +149,7 @@ export default function Film() {
     // eslint-disable-next-line
   }, []);
 
-  const height = reduced || failed ? '100lvh' : `calc(100svh + ${CONFIG.scrollSeconds * CONFIG.pxPerSecond}px)`;
+  const height = reduced || failed ? '100lvh' : 'calc(100svh + ' + CONFIG.scrollSeconds * CONFIG.pxPerSecond + 'px)';
 
   return (
     <section id="film" ref={section} style={{ height, background: CONFIG.bg }} aria-label="XMARKET animation">

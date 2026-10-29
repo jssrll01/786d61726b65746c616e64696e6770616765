@@ -1,58 +1,129 @@
 const base = import.meta.env.BASE_URL;
-const name = (i) => `${base}frames/f${String(i + 1).padStart(4, '0')}.webp`;
+const url = (dir, i) => `${base}${dir}/f${String(i + 1).padStart(4, '0')}.webp`;
 
-export async function loadManifest() {
-  const res = await fetch(`${base}frames/manifest.json`, { cache: 'no-cache' });
-  if (!res.ok) throw new Error('Frame manifest missing. Run: sh scripts/extract-frames.sh');
-  const m = await res.json();
-  if (!m.count || m.count < 1) throw new Error('Frame manifest is empty');
+async function tryManifest(dir) {
+  try {
+    const res = await fetch(`${base}${dir}/manifest.json`, { cache: 'no-cache' });
+    if (!res.ok) return null;
+    const m = await res.json();
+    return m && m.count > 0 ? { ...m, dir } : null;
+  } catch (e) { return null; }
+}
+
+export async function loadManifest(preferred) {
+  const m = (await tryManifest(preferred)) || (preferred !== 'frames' ? await tryManifest('frames') : null);
+  if (!m) throw new Error('Frame manifest missing. Run: sh scripts/extract-frames.sh');
   return m;
 }
 
-function loadOne(i) {
-  return new Promise((resolve) => {
-    const img = new Image();
-    img.decoding = 'async';
-    img.onload = async () => {
-      try { if (img.decode) await img.decode(); } catch (e) { /* draw anyway */ }
-      resolve(img);
-    };
-    img.onerror = () => resolve(null);
-    img.src = name(i);
-  });
+async function decodeBlob(blob) {
+  if (self.createImageBitmap) {
+    try { return await createImageBitmap(blob); } catch (e) { /* fall back below */ }
+  }
+  const u = URL.createObjectURL(blob);
+  const img = new Image();
+  img.src = u;
+  try { await img.decode(); } finally { URL.revokeObjectURL(u); }
+  return img;
 }
 
-// Loads frame 0 first, then the rest with limited concurrency. One retry per failed frame.
-export function createLoader(count, { onFrame }) {
-  const frames = new Array(count).fill(null);
-  let aborted = false;
-  let loaded = 0;
-  async function get(i) {
-    let img = await loadOne(i);
-    if (!img && !aborted) img = await loadOne(i);
-    if (aborted) return;
-    if (img) { frames[i] = img; loaded += 1; }
-    onFrame(i, loaded, !!img);
+export class FrameStore {
+  constructor(dir, count, opts) {
+    this.dir = dir; this.count = count;
+    this.max = (opts && opts.maxInflight) || 4;
+    this.blobs = new Array(count).fill(null);
+    this.maps = new Array(count).fill(null);
+    this.pending = new Set();
+    this.dead = false; this.halted = false; this.sized = false;
+    this.fwd = 24; this.back = 8;
+    this.center = 0; this.way = 1; this.lastKey = '';
+    this.onDecoded = null;
   }
-  async function start(concurrency) {
-    await get(0);
-    let next = 1;
+
+  setWindow(w, h, mb) {
+    const n = Math.max(16, Math.floor((mb * 1048576) / (w * h * 4)));
+    this.fwd = Math.max(12, Math.floor(n * 0.8));
+    this.back = Math.max(4, n - this.fwd);
+  }
+
+  async fetchOne(i) {
+    for (let t = 0; t < 2 && !this.blobs[i] && !this.dead; t++) {
+      try {
+        const r = await fetch(url(this.dir, i));
+        if (r.ok) this.blobs[i] = await r.blob();
+      } catch (e) { /* retry once */ }
+    }
+    return !!this.blobs[i];
+  }
+
+  async start(first, concurrency, onFirst) {
+    const ok = await this.fetchOne(first);
+    onFirst(ok);
+    if (!ok) return;
+    const order = [];
+    for (let i = 0; i < this.count; i++) if (i !== first) order.push(i);
+    const rank = (a) => Math.abs(a - first) + (a < first ? 0.5 : 0);
+    order.sort((a, b) => rank(a) - rank(b));
+    let next = 0;
     const worker = async () => {
-      while (!aborted && next < count) { const i = next++; await get(i); }
+      while (!this.dead && !this.halted && next < order.length) {
+        const i = order[next++];
+        await this.fetchOne(i);
+        if (i >= this.center - this.back && i <= this.center + this.fwd) this.ensure(this.center, this.way, true);
+      }
     };
     await Promise.all(Array.from({ length: concurrency }, worker));
   }
-  return { frames, start, abort: () => { aborted = true; } };
-}
 
-// Index of the closest loaded frame to `want`, or -1.
-export function nearest(frames, want) {
-  const n = frames.length;
-  const w = Math.max(0, Math.min(n - 1, want));
-  if (frames[w]) return w;
-  for (let d = 1; d < n; d++) {
-    if (w - d >= 0 && frames[w - d]) return w - d;
-    if (w + d < n && frames[w + d]) return w + d;
+  range() {
+    const a = this.way > 0 ? this.back : this.fwd;
+    const b = this.way > 0 ? this.fwd : this.back;
+    return [Math.max(0, this.center - a), Math.min(this.count - 1, this.center + b)];
   }
-  return -1;
+
+  ensure(center, way, force) {
+    const key = center + ':' + way;
+    if (!force && key === this.lastKey) return;
+    this.lastKey = key; this.center = center; this.way = way;
+    const [lo, hi] = this.range();
+    for (let i = 0; i < this.count; i++) {
+      const m = this.maps[i];
+      if (m && (i < lo || i > hi)) { if (m.close) m.close(); this.maps[i] = null; }
+    }
+    const want = (i) => i >= lo && i <= hi && this.blobs[i] && !this.maps[i] && !this.pending.has(i);
+    const span = Math.max(hi - center, center - lo);
+    for (let d = 0; d <= span && this.pending.size < this.max; d++) {
+      const list = d === 0 ? [center] : [center + way * d, center - way * d];
+      for (const i of list) {
+        if (this.pending.size >= this.max) break;
+        if (want(i)) this.decode(i);
+      }
+    }
+  }
+
+  decode(i) {
+    this.pending.add(i);
+    decodeBlob(this.blobs[i]).then((bm) => {
+      this.pending.delete(i);
+      const [lo, hi] = this.range();
+      if (this.dead || this.maps[i] || i < lo || i > hi) { if (bm.close) bm.close(); }
+      else { this.maps[i] = bm; if (this.onDecoded) this.onDecoded(i); }
+      if (!this.dead) this.ensure(this.center, this.way, true);
+    }).catch(() => { this.pending.delete(i); });
+  }
+
+  pick(want) {
+    const w = Math.max(0, Math.min(this.count - 1, want));
+    if (this.maps[w]) return w;
+    for (let d = 1; d <= 120; d++) {
+      if (w - d >= 0 && this.maps[w - d]) return w - d;
+      if (w + d < this.count && this.maps[w + d]) return w + d;
+    }
+    return -1;
+  }
+
+  destroy() {
+    this.dead = true;
+    for (let i = 0; i < this.count; i++) { const m = this.maps[i]; if (m && m.close) m.close(); this.maps[i] = null; this.blobs[i] = null; }
+  }
 }

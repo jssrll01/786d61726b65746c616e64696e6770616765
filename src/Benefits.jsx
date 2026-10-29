@@ -1,8 +1,8 @@
 const items = [
-  ['Product discovery', 'Find products across a range of categories in one place.'],
-  ['Convenient online shopping', 'Browse and shop from your phone or computer.'],
-  ['Order tracking', 'Follow your orders from the app.'],
-  ['Loyalty and rewards', 'Take part in XMARKET rewards and activities.'],
+  ['Browse', 'Explore products and stores in XMARKET.'],
+  ['Pay your way', 'Use your Xwallet balance, Xcards or vouchers at checkout.'],
+  ['Track orders', 'Follow your orders from the app.'],
+  ['Earn', 'Collect Loyalty Points and take part in Play Time.'],
 ];
 export default function Benefits() {
   return (
